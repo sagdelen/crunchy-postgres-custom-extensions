@@ -4,8 +4,8 @@ metadata:
   name: partman-test
   namespace: default
 spec:
-  postgresVersion: 17
-  image: agdelen/crunchy-postgres-custom:ubi8-17.2-2
+  postgresVersion: ${POSTGRES_VERSION}
+  image: ${IMAGE_NAME}:${IMAGE_TAG}
 
   patroni:
     dynamicConfiguration:

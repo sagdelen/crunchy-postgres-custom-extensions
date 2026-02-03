@@ -2,6 +2,7 @@
 CLUSTER_NAME = "pgo-test"
 IMAGE_NAME = "agdelen/crunchy-postgres-custom"
 IMAGE_TAG = "ubi8-17.2-2"
+POSTGRES_VERSION = "17"
 DATABASES = "db1 db2 db3 db4 db5"
 WAIT_TIMEOUT = "180s"
 
@@ -87,8 +88,8 @@ set -e
 # Delete existing cluster if any
 kubectl delete postgrescluster partman-test --ignore-not-found=true
 
-echo "→ Deploying PostgresCluster..."
-kubectl apply -f test/postgrescluster.yaml
+echo "→ Deploying PostgresCluster with image: ${IMAGE_NAME}:${IMAGE_TAG} (PG ${POSTGRES_VERSION})"
+envsubst < test/postgrescluster.yaml | kubectl apply -f -
 
 echo "→ Waiting for PostgresCluster to be ready..."
 for i in {1..60}; do
