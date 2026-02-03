@@ -1,4 +1,5 @@
-FROM registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi8-17.2-2
+ARG BASE_IMAGE_TAG=ubi8-17.2-2
+FROM registry.developers.crunchydata.com/crunchydata/crunchy-postgres:${BASE_IMAGE_TAG}
 
 USER root
 
