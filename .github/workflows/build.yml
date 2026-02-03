@@ -11,6 +11,9 @@ on:
         required: false
         default: ""
 
+env:
+  DOCKER_REPO: agdelen/crunchy-postgres-custom
+
 jobs:
   # Default builds: PG 17 and PG 18 (runs on push or when no custom tag provided)
   build-default:
@@ -24,10 +27,12 @@ jobs:
           - base_image_tag: ubi9-18.1-2550
             pg_version: "18"
     outputs:
-      pg17_image: ${{ steps.set-outputs.outputs.pg17_image }}
-      pg18_image: ${{ steps.set-outputs.outputs.pg18_image }}
-      pg17_tag: ${{ steps.set-outputs.outputs.pg17_tag }}
-      pg18_tag: ${{ steps.set-outputs.outputs.pg18_tag }}
+      pg17_tag_ts: ${{ steps.set-outputs.outputs.pg17_tag_ts }}
+      pg17_tag_base: ${{ steps.set-outputs.outputs.pg17_tag_base }}
+      pg17_tag_latest: ${{ steps.set-outputs.outputs.pg17_tag_latest }}
+      pg18_tag_ts: ${{ steps.set-outputs.outputs.pg18_tag_ts }}
+      pg18_tag_base: ${{ steps.set-outputs.outputs.pg18_tag_base }}
+      pg18_tag_latest: ${{ steps.set-outputs.outputs.pg18_tag_latest }}
 
     steps:
       - name: Checkout repository
@@ -50,6 +55,7 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -58,21 +64,24 @@ jobs:
           build-args: |
             BASE_IMAGE_TAG=${{ matrix.base_image_tag }}
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ matrix.base_image_tag }}-${{ steps.timestamp.outputs.ts }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ matrix.base_image_tag }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:pg${{ matrix.pg_version }}-latest
+            ${{ env.DOCKER_REPO }}:${{ matrix.base_image_tag }}-${{ steps.timestamp.outputs.ts }}
+            ${{ env.DOCKER_REPO }}:${{ matrix.base_image_tag }}
+            ${{ env.DOCKER_REPO }}:pg${{ matrix.pg_version }}-latest
           cache-from: type=gha,scope=${{ matrix.base_image_tag }}
           cache-to: type=gha,mode=max,scope=${{ matrix.base_image_tag }}
 
       - name: Set outputs for test job
         id: set-outputs
         run: |
+          TS="${{ steps.timestamp.outputs.ts }}"
           if [ "${{ matrix.pg_version }}" = "17" ]; then
-            echo "pg17_image=${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom" >> $GITHUB_OUTPUT
-            echo "pg17_tag=pg17-latest" >> $GITHUB_OUTPUT
+            echo "pg17_tag_ts=${{ matrix.base_image_tag }}-${TS}" >> $GITHUB_OUTPUT
+            echo "pg17_tag_base=${{ matrix.base_image_tag }}" >> $GITHUB_OUTPUT
+            echo "pg17_tag_latest=pg17-latest" >> $GITHUB_OUTPUT
           elif [ "${{ matrix.pg_version }}" = "18" ]; then
-            echo "pg18_image=${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom" >> $GITHUB_OUTPUT
-            echo "pg18_tag=pg18-latest" >> $GITHUB_OUTPUT
+            echo "pg18_tag_ts=${{ matrix.base_image_tag }}-${TS}" >> $GITHUB_OUTPUT
+            echo "pg18_tag_base=${{ matrix.base_image_tag }}" >> $GITHUB_OUTPUT
+            echo "pg18_tag_latest=pg18-latest" >> $GITHUB_OUTPUT
           fi
 
   # Test both PG 17 and PG 18 images
@@ -119,12 +128,12 @@ jobs:
 
       - name: Pull and load image
         run: |
-          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ matrix.image_tag }}
-          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ matrix.image_tag }} --name pgo-test
+          docker pull ${{ env.DOCKER_REPO }}:${{ matrix.image_tag }}
+          kind load docker-image ${{ env.DOCKER_REPO }}:${{ matrix.image_tag }} --name pgo-test
 
       - name: Deploy PostgresCluster
         env:
-          IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom
+          IMAGE_NAME: ${{ env.DOCKER_REPO }}
           IMAGE_TAG: ${{ matrix.image_tag }}
           POSTGRES_VERSION: ${{ matrix.pg_version }}
         run: |
@@ -153,40 +162,43 @@ jobs:
         run: |
           POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
 
-          # Check shared_preload_libraries
           SHARED_LIBS=$(kubectl exec ${POD} -c database -- psql -U postgres -t -c "SHOW shared_preload_libraries;" | tr -d ' ')
           echo "shared_preload_libraries: $SHARED_LIBS"
 
           RESULT="PASSED"
+          PARTITIONS_BEFORE=""
+          PARTITIONS_AFTER=""
+          ROWS_BEFORE=""
+          ROWS_AFTER=""
 
           # Test both databases
           for db in db1 db2; do
             echo "=== Testing ${db} ==="
             
-            PARTITIONS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-            ROWS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
-            echo "Before: $PARTITIONS_BEFORE partitions, $ROWS_BEFORE rows"
+            P_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            R_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "Before: $P_BEFORE partitions, $R_BEFORE rows"
 
             kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "CALL partman.run_maintenance_proc();" >/dev/null
 
-            PARTITIONS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-            ROWS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
-            echo "After: $PARTITIONS_AFTER partitions, $ROWS_AFTER rows"
+            P_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            R_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "After: $P_AFTER partitions, $R_AFTER rows"
 
-            DROPPED=$((PARTITIONS_BEFORE - PARTITIONS_AFTER))
+            DROPPED=$((P_BEFORE - P_AFTER))
             echo "Result: ${DROPPED} partitions dropped"
 
-            if [ "$PARTITIONS_AFTER" -ge "$PARTITIONS_BEFORE" ]; then
+            if [ "$P_AFTER" -ge "$P_BEFORE" ]; then
               echo "FAILED: Retention not working in ${db}"
               RESULT="FAILED"
             fi
 
             # Save results for first db (db1) for summary
             if [ "$db" = "db1" ]; then
-              echo "${db}_partitions_before=$PARTITIONS_BEFORE" >> $GITHUB_ENV
-              echo "${db}_partitions_after=$PARTITIONS_AFTER" >> $GITHUB_ENV
-              echo "${db}_rows_before=$ROWS_BEFORE" >> $GITHUB_ENV
-              echo "${db}_rows_after=$ROWS_AFTER" >> $GITHUB_ENV
+              PARTITIONS_BEFORE="$P_BEFORE"
+              PARTITIONS_AFTER="$P_AFTER"
+              ROWS_BEFORE="$R_BEFORE"
+              ROWS_AFTER="$R_AFTER"
             fi
           done
 
@@ -200,17 +212,17 @@ jobs:
           # Set outputs based on PG version
           if [ "${{ matrix.pg_version }}" = "17" ]; then
             echo "pg17_result=$RESULT" >> $GITHUB_OUTPUT
-            echo "pg17_partitions_before=$db1_partitions_before" >> $GITHUB_OUTPUT
-            echo "pg17_partitions_after=$db1_partitions_after" >> $GITHUB_OUTPUT
-            echo "pg17_rows_before=$db1_rows_before" >> $GITHUB_OUTPUT
-            echo "pg17_rows_after=$db1_rows_after" >> $GITHUB_OUTPUT
+            echo "pg17_partitions_before=$PARTITIONS_BEFORE" >> $GITHUB_OUTPUT
+            echo "pg17_partitions_after=$PARTITIONS_AFTER" >> $GITHUB_OUTPUT
+            echo "pg17_rows_before=$ROWS_BEFORE" >> $GITHUB_OUTPUT
+            echo "pg17_rows_after=$ROWS_AFTER" >> $GITHUB_OUTPUT
             echo "pg17_shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
           else
             echo "pg18_result=$RESULT" >> $GITHUB_OUTPUT
-            echo "pg18_partitions_before=$db1_partitions_before" >> $GITHUB_OUTPUT
-            echo "pg18_partitions_after=$db1_partitions_after" >> $GITHUB_OUTPUT
-            echo "pg18_rows_before=$db1_rows_before" >> $GITHUB_OUTPUT
-            echo "pg18_rows_after=$db1_rows_after" >> $GITHUB_OUTPUT
+            echo "pg18_partitions_before=$PARTITIONS_BEFORE" >> $GITHUB_OUTPUT
+            echo "pg18_partitions_after=$PARTITIONS_AFTER" >> $GITHUB_OUTPUT
+            echo "pg18_rows_before=$ROWS_BEFORE" >> $GITHUB_OUTPUT
+            echo "pg18_rows_after=$ROWS_AFTER" >> $GITHUB_OUTPUT
             echo "pg18_shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
           fi
 
@@ -225,33 +237,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate Report
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          cat >> $GITHUB_STEP_SUMMARY << EOF
           # 🐘 Crunchy PostgreSQL Custom Image - Build Report
 
           ## 📦 Published Images
 
-          | PostgreSQL | Image | Tag |
-          |------------|-------|-----|
-          | PG 17 | `${{ env.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg17-latest` |
-          | PG 18 | `${{ env.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg18-latest` |
+          | PostgreSQL | Image | Tags |
+          |------------|-------|------|
+          | PG 17 | [\`${{ env.DOCKER_REPO }}\`](https://hub.docker.com/r/${{ env.DOCKER_REPO }}) | \`${{ needs.build-default.outputs.pg17_tag_latest }}\`, \`${{ needs.build-default.outputs.pg17_tag_base }}\`, \`${{ needs.build-default.outputs.pg17_tag_ts }}\` |
+          | PG 18 | [\`${{ env.DOCKER_REPO }}\`](https://hub.docker.com/r/${{ env.DOCKER_REPO }}) | \`${{ needs.build-default.outputs.pg18_tag_latest }}\`, \`${{ needs.build-default.outputs.pg18_tag_base }}\`, \`${{ needs.build-default.outputs.pg18_tag_ts }}\` |
 
-          ## 🧪 Validation Results
+          ## 🧪 pg_partman_bgw Retention Test
 
           | PostgreSQL | Status | Partitions | Records | Extensions |
           |------------|--------|------------|---------|------------|
-          | PG 17 | ${{ needs.test-default.outputs.pg17_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-default.outputs.pg17_partitions_before }} → ${{ needs.test-default.outputs.pg17_partitions_after }} | ${{ needs.test-default.outputs.pg17_rows_before }} → ${{ needs.test-default.outputs.pg17_rows_after }} | `${{ needs.test-default.outputs.pg17_shared_libs }}` |
-          | PG 18 | ${{ needs.test-default.outputs.pg18_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-default.outputs.pg18_partitions_before }} → ${{ needs.test-default.outputs.pg18_partitions_after }} | ${{ needs.test-default.outputs.pg18_rows_before }} → ${{ needs.test-default.outputs.pg18_rows_after }} | `${{ needs.test-default.outputs.pg18_shared_libs }}` |
+          | PG 17 | ${{ needs.test-default.outputs.pg17_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-default.outputs.pg17_partitions_before }} → ${{ needs.test-default.outputs.pg17_partitions_after }} | ${{ needs.test-default.outputs.pg17_rows_before }} → ${{ needs.test-default.outputs.pg17_rows_after }} | \`${{ needs.test-default.outputs.pg17_shared_libs }}\` |
+          | PG 18 | ${{ needs.test-default.outputs.pg18_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-default.outputs.pg18_partitions_before }} → ${{ needs.test-default.outputs.pg18_partitions_after }} | ${{ needs.test-default.outputs.pg18_rows_before }} → ${{ needs.test-default.outputs.pg18_rows_after }} | \`${{ needs.test-default.outputs.pg18_shared_libs }}\` |
 
-          ## 📋 Test Details
-
-          - **Databases tested**: db1, db2
-          - **Partition interval**: 1 minute
-          - **Retention**: 5 minutes
-          - **Test data**: 100 records (10 per minute, last 10 minutes)
-          - **Expected**: Partitions reduced after maintenance, old data dropped
+          **Test Config**: 1-minute partitions, 5-minute retention, 100 records across 10 minutes, tested on db1 & db2
           EOF
 
   # Custom build: user-specified base image tag
@@ -259,7 +263,8 @@ jobs:
     if: github.event.inputs.base_image_tag != '' && github.event.inputs.base_image_tag != null
     runs-on: ubuntu-latest
     outputs:
-      image_tag: ${{ github.event.inputs.base_image_tag }}
+      tag_ts: ${{ steps.set-outputs.outputs.tag_ts }}
+      tag_base: ${{ steps.set-outputs.outputs.tag_base }}
 
     steps:
       - name: Checkout repository
@@ -296,10 +301,16 @@ jobs:
           build-args: |
             BASE_IMAGE_TAG=${{ github.event.inputs.base_image_tag }}
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ github.event.inputs.base_image_tag }}-${{ steps.timestamp.outputs.ts }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ github.event.inputs.base_image_tag }}
+            ${{ env.DOCKER_REPO }}:${{ github.event.inputs.base_image_tag }}-${{ steps.timestamp.outputs.ts }}
+            ${{ env.DOCKER_REPO }}:${{ github.event.inputs.base_image_tag }}
           cache-from: type=gha,scope=${{ github.event.inputs.base_image_tag }}
           cache-to: type=gha,mode=max,scope=${{ github.event.inputs.base_image_tag }}
+
+      - name: Set outputs
+        id: set-outputs
+        run: |
+          echo "tag_ts=${{ github.event.inputs.base_image_tag }}-${{ steps.timestamp.outputs.ts }}" >> $GITHUB_OUTPUT
+          echo "tag_base=${{ github.event.inputs.base_image_tag }}" >> $GITHUB_OUTPUT
 
   # Test custom build
   test-custom:
@@ -338,12 +349,12 @@ jobs:
 
       - name: Pull and load image
         run: |
-          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ github.event.inputs.base_image_tag }}
-          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ github.event.inputs.base_image_tag }} --name pgo-test
+          docker pull ${{ env.DOCKER_REPO }}:${{ github.event.inputs.base_image_tag }}
+          kind load docker-image ${{ env.DOCKER_REPO }}:${{ github.event.inputs.base_image_tag }} --name pgo-test
 
       - name: Deploy PostgresCluster
         env:
-          IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom
+          IMAGE_NAME: ${{ env.DOCKER_REPO }}
           IMAGE_TAG: ${{ github.event.inputs.base_image_tag }}
           POSTGRES_VERSION: ${{ steps.pg-version.outputs.version }}
         run: |
@@ -376,29 +387,33 @@ jobs:
           echo "shared_preload_libraries: $SHARED_LIBS"
 
           RESULT="PASSED"
+          PARTITIONS_BEFORE=""
+          PARTITIONS_AFTER=""
+          ROWS_BEFORE=""
+          ROWS_AFTER=""
 
           for db in db1 db2; do
             echo "=== Testing ${db} ==="
             
-            PARTITIONS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-            ROWS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
-            echo "Before: $PARTITIONS_BEFORE partitions, $ROWS_BEFORE rows"
+            P_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            R_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "Before: $P_BEFORE partitions, $R_BEFORE rows"
 
             kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "CALL partman.run_maintenance_proc();" >/dev/null
 
-            PARTITIONS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-            ROWS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
-            echo "After: $PARTITIONS_AFTER partitions, $ROWS_AFTER rows"
+            P_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            R_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "After: $P_AFTER partitions, $R_AFTER rows"
 
-            if [ "$PARTITIONS_AFTER" -ge "$PARTITIONS_BEFORE" ]; then
+            if [ "$P_AFTER" -ge "$P_BEFORE" ]; then
               RESULT="FAILED"
             fi
 
             if [ "$db" = "db1" ]; then
-              echo "partitions_before=$PARTITIONS_BEFORE" >> $GITHUB_OUTPUT
-              echo "partitions_after=$PARTITIONS_AFTER" >> $GITHUB_OUTPUT
-              echo "rows_before=$ROWS_BEFORE" >> $GITHUB_OUTPUT
-              echo "rows_after=$ROWS_AFTER" >> $GITHUB_OUTPUT
+              PARTITIONS_BEFORE="$P_BEFORE"
+              PARTITIONS_AFTER="$P_AFTER"
+              ROWS_BEFORE="$R_BEFORE"
+              ROWS_AFTER="$R_AFTER"
             fi
           done
 
@@ -407,6 +422,10 @@ jobs:
           fi
 
           echo "result=$RESULT" >> $GITHUB_OUTPUT
+          echo "partitions_before=$PARTITIONS_BEFORE" >> $GITHUB_OUTPUT
+          echo "partitions_after=$PARTITIONS_AFTER" >> $GITHUB_OUTPUT
+          echo "rows_before=$ROWS_BEFORE" >> $GITHUB_OUTPUT
+          echo "rows_after=$ROWS_AFTER" >> $GITHUB_OUTPUT
           echo "shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
 
           if [ "$RESULT" = "FAILED" ]; then
@@ -426,28 +445,21 @@ jobs:
           echo "version=$PG_VERSION" >> $GITHUB_OUTPUT
 
       - name: Generate Report
-        env:
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          BASE_IMAGE_TAG: ${{ github.event.inputs.base_image_tag }}
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          cat >> $GITHUB_STEP_SUMMARY << EOF
           # 🐘 Crunchy PostgreSQL Custom Image - Build Report
 
           ## 📦 Published Image
 
-          | PostgreSQL | Image | Tag |
-          |------------|-------|-----|
-          | PG ${{ steps.pg-version.outputs.version }} | `${{ env.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `${{ env.BASE_IMAGE_TAG }}` |
+          | PostgreSQL | Image | Tags |
+          |------------|-------|------|
+          | PG ${{ steps.pg-version.outputs.version }} | [\`${{ env.DOCKER_REPO }}\`](https://hub.docker.com/r/${{ env.DOCKER_REPO }}) | \`${{ needs.build-custom.outputs.tag_base }}\`, \`${{ needs.build-custom.outputs.tag_ts }}\` |
 
-          ## 🧪 Validation Results
+          ## 🧪 pg_partman_bgw Retention Test
 
           | Status | Partitions | Records | Extensions |
           |--------|------------|---------|------------|
-          | ${{ needs.test-custom.outputs.result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-custom.outputs.partitions_before }} → ${{ needs.test-custom.outputs.partitions_after }} | ${{ needs.test-custom.outputs.rows_before }} → ${{ needs.test-custom.outputs.rows_after }} | `${{ needs.test-custom.outputs.shared_libs }}` |
+          | ${{ needs.test-custom.outputs.result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-custom.outputs.partitions_before }} → ${{ needs.test-custom.outputs.partitions_after }} | ${{ needs.test-custom.outputs.rows_before }} → ${{ needs.test-custom.outputs.rows_after }} | \`${{ needs.test-custom.outputs.shared_libs }}\` |
 
-          ## 📋 Test Details
-
-          - **Databases tested**: db1, db2
-          - **Partition interval**: 1 minute
-          - **Retention**: 5 minutes
+          **Test Config**: 1-minute partitions, 5-minute retention, 100 records across 10 minutes, tested on db1 & db2
           EOF
