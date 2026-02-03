@@ -1,14 +1,14 @@
 [env]
 CLUSTER_NAME = "pgo-test"
 IMAGE_NAME = "agdelen/crunchy-postgres-custom"
-IMAGE_TAG = "ubi8-17.2-2"
+IMAGE_TAG = "pg17-latest"
 POSTGRES_VERSION = "17"
 DATABASES = "db1 db2 db3 db4 db5"
 WAIT_TIMEOUT = "180s"
 
 [tasks.test]
 description = "Run full e2e test (cluster setup + validation)"
-depends = ["cluster-up", "pgo-install", "deploy", "setup-partman", "validate"]
+depends = ["validate"]
 
 [tasks.test-quick]
 description = "Run validation only (assumes cluster exists)"
@@ -37,6 +37,7 @@ echo "✓ Cluster ${CLUSTER_NAME} deleted"
 
 [tasks.pgo-install]
 description = "Install Crunchy PostgreSQL Operator"
+depends = ["cluster-up"]
 run = """
 #!/usr/bin/env bash
 set -e
@@ -64,6 +65,7 @@ echo "✓ PGO installed"
 
 [tasks.load-image]
 description = "Pull and load image into Kind"
+depends = ["cluster-up"]
 run = """
 #!/usr/bin/env bash
 set -e
@@ -80,7 +82,7 @@ echo "✓ Image loaded"
 
 [tasks.deploy]
 description = "Deploy PostgresCluster with 5 databases"
-depends = ["load-image"]
+depends = ["load-image", "pgo-install"]
 run = """
 #!/usr/bin/env bash
 set -e
@@ -109,6 +111,7 @@ echo "✓ Master pod: ${POD}"
 
 [tasks.setup-partman]
 description = "Setup pg_partman tables in all databases"
+depends = ["deploy"]
 run = """
 #!/usr/bin/env bash
 set -e
@@ -128,6 +131,7 @@ echo "✓ pg_partman setup complete"
 
 [tasks.validate]
 description = "Validate pg_partman_bgw is working"
+depends = ["setup-partman"]
 run = """
 #!/usr/bin/env bash
 set -e
