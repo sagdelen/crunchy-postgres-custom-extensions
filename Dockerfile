@@ -6,4 +6,4 @@ RUN microdnf install -y pg_partman_17 && \
     microdnf clean all && \
     rm -rf /var/cache/yum
 
-USER postgres
+USER 26
