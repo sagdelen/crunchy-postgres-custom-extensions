@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       base_image_tag:
-        description: 'Custom base image tag (leave empty for default PG 17 & 18 builds)'
+        description: "Custom base image tag (leave empty for default PG 17 & 18 builds)"
         required: false
-        default: ''
+        default: ""
 
 jobs:
   # Default builds: PG 17 and PG 18 (runs on push or when no custom tag provided)
@@ -90,8 +90,14 @@ jobs:
     outputs:
       pg17_result: ${{ steps.test-result.outputs.pg17_result }}
       pg18_result: ${{ steps.test-result.outputs.pg18_result }}
-      pg17_partitions: ${{ steps.test-result.outputs.pg17_partitions }}
-      pg18_partitions: ${{ steps.test-result.outputs.pg18_partitions }}
+      pg17_partitions_before: ${{ steps.test-result.outputs.pg17_partitions_before }}
+      pg17_partitions_after: ${{ steps.test-result.outputs.pg17_partitions_after }}
+      pg18_partitions_before: ${{ steps.test-result.outputs.pg18_partitions_before }}
+      pg18_partitions_after: ${{ steps.test-result.outputs.pg18_partitions_after }}
+      pg17_rows_before: ${{ steps.test-result.outputs.pg17_rows_before }}
+      pg17_rows_after: ${{ steps.test-result.outputs.pg17_rows_after }}
+      pg18_rows_before: ${{ steps.test-result.outputs.pg18_rows_before }}
+      pg18_rows_after: ${{ steps.test-result.outputs.pg18_rows_after }}
       pg17_shared_libs: ${{ steps.test-result.outputs.pg17_shared_libs }}
       pg18_shared_libs: ${{ steps.test-result.outputs.pg18_shared_libs }}
 
@@ -138,7 +144,7 @@ jobs:
         run: |
           POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
           kubectl cp test/setup_partman.sql ${POD}:/tmp/setup_partman.sql -c database
-          for db in db1 db2 db3 db4 db5; do
+          for db in db1 db2; do
             kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -f /tmp/setup_partman.sql -q
           done
 
@@ -151,26 +157,65 @@ jobs:
           SHARED_LIBS=$(kubectl exec ${POD} -c database -- psql -U postgres -t -c "SHOW shared_preload_libraries;" | tr -d ' ')
           echo "shared_preload_libraries: $SHARED_LIBS"
 
-          # Check partition count
-          PARTITIONS=$(kubectl exec ${POD} -c database -- psql -U postgres -d db1 -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-          echo "Partition count: $PARTITIONS"
+          RESULT="PASSED"
 
-          # Check pg_partman_bgw in libraries
-          if echo "$SHARED_LIBS" | grep -q "pg_partman_bgw"; then
-            RESULT="PASSED"
-          else
+          # Test both databases
+          for db in db1 db2; do
+            echo "=== Testing ${db} ==="
+            
+            PARTITIONS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            ROWS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "Before: $PARTITIONS_BEFORE partitions, $ROWS_BEFORE rows"
+
+            kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "CALL partman.run_maintenance_proc();" >/dev/null
+
+            PARTITIONS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            ROWS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "After: $PARTITIONS_AFTER partitions, $ROWS_AFTER rows"
+
+            DROPPED=$((PARTITIONS_BEFORE - PARTITIONS_AFTER))
+            echo "Result: ${DROPPED} partitions dropped"
+
+            if [ "$PARTITIONS_AFTER" -ge "$PARTITIONS_BEFORE" ]; then
+              echo "FAILED: Retention not working in ${db}"
+              RESULT="FAILED"
+            fi
+
+            # Save results for first db (db1) for summary
+            if [ "$db" = "db1" ]; then
+              echo "${db}_partitions_before=$PARTITIONS_BEFORE" >> $GITHUB_ENV
+              echo "${db}_partitions_after=$PARTITIONS_AFTER" >> $GITHUB_ENV
+              echo "${db}_rows_before=$ROWS_BEFORE" >> $GITHUB_ENV
+              echo "${db}_rows_after=$ROWS_AFTER" >> $GITHUB_ENV
+            fi
+          done
+
+          if ! echo "$SHARED_LIBS" | grep -q "pg_partman_bgw"; then
+            echo "FAILED: pg_partman_bgw not in shared_preload_libraries"
             RESULT="FAILED"
           fi
+
+          echo "Test result: $RESULT"
 
           # Set outputs based on PG version
           if [ "${{ matrix.pg_version }}" = "17" ]; then
             echo "pg17_result=$RESULT" >> $GITHUB_OUTPUT
-            echo "pg17_partitions=$PARTITIONS" >> $GITHUB_OUTPUT
+            echo "pg17_partitions_before=$db1_partitions_before" >> $GITHUB_OUTPUT
+            echo "pg17_partitions_after=$db1_partitions_after" >> $GITHUB_OUTPUT
+            echo "pg17_rows_before=$db1_rows_before" >> $GITHUB_OUTPUT
+            echo "pg17_rows_after=$db1_rows_after" >> $GITHUB_OUTPUT
             echo "pg17_shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
           else
             echo "pg18_result=$RESULT" >> $GITHUB_OUTPUT
-            echo "pg18_partitions=$PARTITIONS" >> $GITHUB_OUTPUT
+            echo "pg18_partitions_before=$db1_partitions_before" >> $GITHUB_OUTPUT
+            echo "pg18_partitions_after=$db1_partitions_after" >> $GITHUB_OUTPUT
+            echo "pg18_rows_before=$db1_rows_before" >> $GITHUB_OUTPUT
+            echo "pg18_rows_after=$db1_rows_after" >> $GITHUB_OUTPUT
             echo "pg18_shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
+          fi
+
+          if [ "$RESULT" = "FAILED" ]; then
+            exit 1
           fi
 
   # Generate summary report
@@ -180,51 +225,33 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Generate Report
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
         run: |
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          # 🐘 Crunchy PostgreSQL Custom Image Build Report
+          # 🐘 Crunchy PostgreSQL Custom Image - Build Report
 
           ## 📦 Published Images
 
-          | PostgreSQL | Image | Tags |
-          |------------|-------|------|
-          | **PG 17** | `${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg17-latest`, `ubi9-17.7-2550` |
-          | **PG 18** | `${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg18-latest`, `ubi9-18.1-2550` |
+          | PostgreSQL | Image | Tag |
+          |------------|-------|-----|
+          | PG 17 | `${{ env.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg17-latest` |
+          | PG 18 | `${{ env.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg18-latest` |
 
-          ## 🧪 Test Results
+          ## 🧪 Validation Results
 
-          | PostgreSQL | Status | shared_preload_libraries | Partitions Created |
-          |------------|--------|--------------------------|-------------------|
-          | **PG 17** | ${{ needs.test-default.outputs.pg17_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | `${{ needs.test-default.outputs.pg17_shared_libs }}` | ${{ needs.test-default.outputs.pg17_partitions }} |
-          | **PG 18** | ${{ needs.test-default.outputs.pg18_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | `${{ needs.test-default.outputs.pg18_shared_libs }}` | ${{ needs.test-default.outputs.pg18_partitions }} |
+          | PostgreSQL | Status | Partitions | Records | Extensions |
+          |------------|--------|------------|---------|------------|
+          | PG 17 | ${{ needs.test-default.outputs.pg17_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-default.outputs.pg17_partitions_before }} → ${{ needs.test-default.outputs.pg17_partitions_after }} | ${{ needs.test-default.outputs.pg17_rows_before }} → ${{ needs.test-default.outputs.pg17_rows_after }} | `${{ needs.test-default.outputs.pg17_shared_libs }}` |
+          | PG 18 | ${{ needs.test-default.outputs.pg18_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-default.outputs.pg18_partitions_before }} → ${{ needs.test-default.outputs.pg18_partitions_after }} | ${{ needs.test-default.outputs.pg18_rows_before }} → ${{ needs.test-default.outputs.pg18_rows_after }} | `${{ needs.test-default.outputs.pg18_shared_libs }}` |
 
-          ## 🔧 Extensions Tested
+          ## 📋 Test Details
 
-          - **pg_partman_bgw**: Background worker for automated partition maintenance
-            - Automatic partition creation ✅
-            - Retention policy configured (5 minutes for testing)
-            - Running on 5 databases: db1, db2, db3, db4, db5
-
-          ## 🏗️ Build Details
-
-          - **Platforms**: `linux/amd64`, `linux/arm64`
-          - **Base Images**:
-            - PG 17: `registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-17.7-2550`
-            - PG 18: `registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-18.1-2550`
-
-          ## 📋 Usage
-
-          ```yaml
-          spec:
-            image: ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:pg17-latest
-            patroni:
-              dynamicConfiguration:
-                postgresql:
-                  parameters:
-                    shared_preload_libraries: pg_partman_bgw
-                    pg_partman_bgw.dbname: mydb
-                    pg_partman_bgw.interval: 3600
-          ```
+          - **Databases tested**: db1, db2
+          - **Partition interval**: 1 minute
+          - **Retention**: 5 minutes
+          - **Test data**: 100 records (10 per minute, last 10 minutes)
+          - **Expected**: Partitions reduced after maintenance, old data dropped
           EOF
 
   # Custom build: user-specified base image tag
@@ -281,7 +308,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       result: ${{ steps.test-result.outputs.result }}
-      partitions: ${{ steps.test-result.outputs.partitions }}
+      partitions_before: ${{ steps.test-result.outputs.partitions_before }}
+      partitions_after: ${{ steps.test-result.outputs.partitions_after }}
+      rows_before: ${{ steps.test-result.outputs.rows_before }}
+      rows_after: ${{ steps.test-result.outputs.rows_after }}
       shared_libs: ${{ steps.test-result.outputs.shared_libs }}
 
     steps:
@@ -333,7 +363,7 @@ jobs:
         run: |
           POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
           kubectl cp test/setup_partman.sql ${POD}:/tmp/setup_partman.sql -c database
-          for db in db1 db2 db3 db4 db5; do
+          for db in db1 db2; do
             kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -f /tmp/setup_partman.sql -q
           done
 
@@ -343,15 +373,45 @@ jobs:
           POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
 
           SHARED_LIBS=$(kubectl exec ${POD} -c database -- psql -U postgres -t -c "SHOW shared_preload_libraries;" | tr -d ' ')
-          PARTITIONS=$(kubectl exec ${POD} -c database -- psql -U postgres -d db1 -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+          echo "shared_preload_libraries: $SHARED_LIBS"
 
-          if echo "$SHARED_LIBS" | grep -q "pg_partman_bgw"; then
-            echo "result=PASSED" >> $GITHUB_OUTPUT
-          else
-            echo "result=FAILED" >> $GITHUB_OUTPUT
+          RESULT="PASSED"
+
+          for db in db1 db2; do
+            echo "=== Testing ${db} ==="
+            
+            PARTITIONS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            ROWS_BEFORE=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "Before: $PARTITIONS_BEFORE partitions, $ROWS_BEFORE rows"
+
+            kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "CALL partman.run_maintenance_proc();" >/dev/null
+
+            PARTITIONS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+            ROWS_AFTER=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+            echo "After: $PARTITIONS_AFTER partitions, $ROWS_AFTER rows"
+
+            if [ "$PARTITIONS_AFTER" -ge "$PARTITIONS_BEFORE" ]; then
+              RESULT="FAILED"
+            fi
+
+            if [ "$db" = "db1" ]; then
+              echo "partitions_before=$PARTITIONS_BEFORE" >> $GITHUB_OUTPUT
+              echo "partitions_after=$PARTITIONS_AFTER" >> $GITHUB_OUTPUT
+              echo "rows_before=$ROWS_BEFORE" >> $GITHUB_OUTPUT
+              echo "rows_after=$ROWS_AFTER" >> $GITHUB_OUTPUT
+            fi
+          done
+
+          if ! echo "$SHARED_LIBS" | grep -q "pg_partman_bgw"; then
+            RESULT="FAILED"
           fi
-          echo "partitions=$PARTITIONS" >> $GITHUB_OUTPUT
+
+          echo "result=$RESULT" >> $GITHUB_OUTPUT
           echo "shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
+
+          if [ "$RESULT" = "FAILED" ]; then
+            exit 1
+          fi
 
   # Generate report for custom build
   report-custom:
@@ -366,28 +426,28 @@ jobs:
           echo "version=$PG_VERSION" >> $GITHUB_OUTPUT
 
       - name: Generate Report
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          BASE_IMAGE_TAG: ${{ github.event.inputs.base_image_tag }}
         run: |
           cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          # 🐘 Crunchy PostgreSQL Custom Image Build Report
+          # 🐘 Crunchy PostgreSQL Custom Image - Build Report
 
           ## 📦 Published Image
 
           | PostgreSQL | Image | Tag |
           |------------|-------|-----|
-          | **PG ${{ steps.pg-version.outputs.version }}** | `${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `${{ github.event.inputs.base_image_tag }}` |
+          | PG ${{ steps.pg-version.outputs.version }} | `${{ env.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `${{ env.BASE_IMAGE_TAG }}` |
 
-          ## 🧪 Test Results
+          ## 🧪 Validation Results
 
-          | Status | shared_preload_libraries | Partitions Created |
-          |--------|--------------------------|-------------------|
-          | ${{ needs.test-custom.outputs.result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | `${{ needs.test-custom.outputs.shared_libs }}` | ${{ needs.test-custom.outputs.partitions }} |
+          | Status | Partitions | Records | Extensions |
+          |--------|------------|---------|------------|
+          | ${{ needs.test-custom.outputs.result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | ${{ needs.test-custom.outputs.partitions_before }} → ${{ needs.test-custom.outputs.partitions_after }} | ${{ needs.test-custom.outputs.rows_before }} → ${{ needs.test-custom.outputs.rows_after }} | `${{ needs.test-custom.outputs.shared_libs }}` |
 
-          ## 🔧 Extensions Tested
+          ## 📋 Test Details
 
-          - **pg_partman_bgw**: Background worker for automated partition maintenance ✅
-
-          ## 🏗️ Build Details
-
-          - **Platforms**: `linux/amd64`, `linux/arm64`
-          - **Base Image**: `registry.developers.crunchydata.com/crunchydata/crunchy-postgres:${{ github.event.inputs.base_image_tag }}`
+          - **Databases tested**: db1, db2
+          - **Partition interval**: 1 minute
+          - **Retention**: 5 minutes
           EOF

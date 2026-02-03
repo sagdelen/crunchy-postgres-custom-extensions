@@ -3,16 +3,16 @@ CLUSTER_NAME = "pgo-test"
 IMAGE_NAME = "agdelen/crunchy-postgres-custom"
 IMAGE_TAG = "pg17-latest"
 POSTGRES_VERSION = "17"
-DATABASES = "db1 db2 db3 db4 db5"
+DATABASES = "db1 db2"
 WAIT_TIMEOUT = "180s"
 
-[tasks.test]
-description = "Run full e2e test (cluster setup + validation)"
-depends = ["validate"]
+# =============================================================================
+# CI/CD TASKS - Full lifecycle
+# =============================================================================
 
-[tasks.test-quick]
-description = "Run validation only (assumes cluster exists)"
-depends = ["validate"]
+[tasks.test]
+description = "CI/CD: Full e2e test (up → setup → validate → down)"
+depends = ["validate", "cluster-down"]
 
 [tasks.cluster-up]
 description = "Create Kind cluster"
@@ -41,24 +41,17 @@ depends = ["cluster-up"]
 run = """
 #!/usr/bin/env bash
 set -e
-
-# Check if PGO is already installed
 if kubectl get deployment pgo -n postgres-operator &>/dev/null; then
   echo "✓ PGO already installed"
   exit 0
 fi
 
-echo "→ Cloning postgres-operator repo..."
+echo "→ Installing PGO..."
 TEMP_DIR=$(mktemp -d)
 git clone --depth 1 https://github.com/CrunchyData/postgres-operator.git "$TEMP_DIR/pgo"
-
-echo "→ Installing PGO..."
 kubectl apply -k "$TEMP_DIR/pgo/config/namespace"
 kubectl apply --server-side -k "$TEMP_DIR/pgo/config/default"
-
-echo "→ Waiting for PGO to be ready..."
 kubectl wait --for=condition=Available deployment/pgo -n postgres-operator --timeout=${WAIT_TIMEOUT}
-
 rm -rf "$TEMP_DIR"
 echo "✓ PGO installed"
 """
@@ -70,140 +63,163 @@ run = """
 #!/usr/bin/env bash
 set -e
 FULL_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
-
 echo "→ Pulling image: ${FULL_IMAGE}"
 docker pull ${FULL_IMAGE}
-
-echo "→ Loading image into Kind cluster..."
+echo "→ Loading into Kind..."
 kind load docker-image ${FULL_IMAGE} --name ${CLUSTER_NAME}
-
 echo "✓ Image loaded"
 """
 
 [tasks.deploy]
-description = "Deploy PostgresCluster with 5 databases"
+description = "Deploy PostgresCluster"
 depends = ["load-image", "pgo-install"]
 run = """
 #!/usr/bin/env bash
 set -e
-
-# Delete existing cluster if any
 kubectl delete postgrescluster partman-test --ignore-not-found=true
-
-echo "→ Deploying PostgresCluster with image: ${IMAGE_NAME}:${IMAGE_TAG} (PG ${POSTGRES_VERSION})"
+echo "→ Deploying PostgresCluster..."
 envsubst < test/postgrescluster.yaml | kubectl apply -f -
 
-echo "→ Waiting for PostgresCluster to be ready..."
+echo "→ Waiting for PostgresCluster..."
 for i in {1..60}; do
   READY=$(kubectl get postgrescluster partman-test -o jsonpath='{.status.instances[0].readyReplicas}' 2>/dev/null || echo "0")
   if [ "$READY" = "1" ]; then
-    echo "✓ PostgresCluster ready"
-    break
+    POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+    echo "✓ PostgresCluster ready (pod: ${POD})"
+    exit 0
   fi
   echo "  Waiting... ($i/60)"
   sleep 5
 done
-
-# Get pod name
-POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
-echo "✓ Master pod: ${POD}"
+echo "✗ Timeout waiting for PostgresCluster"
+exit 1
 """
 
-[tasks.setup-partman]
-description = "Setup pg_partman tables in all databases"
+# =============================================================================
+# LOCAL DEV TASKS - Keep cluster, reset DB only
+# =============================================================================
+
+[tasks.up]
+description = "Local: Start cluster (keeps running)"
 depends = ["deploy"]
+
+[tasks.down]
+description = "Local: Stop cluster"
+depends = ["cluster-down"]
+
+[tasks.reset]
+description = "Local: Reset databases only (drop events tables in all DBs)"
 run = """
 #!/usr/bin/env bash
 set -e
-
 POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
 
-echo "→ Copying setup script to pod..."
+echo "=== RESET: Dropping events tables ==="
+for db in ${DATABASES}; do
+  echo "→ Resetting ${db}..."
+  kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "
+    DELETE FROM partman.part_config WHERE parent_table = 'public.events';
+    DROP TABLE IF EXISTS events CASCADE;
+    DROP TABLE IF EXISTS partman.template_public_events CASCADE;
+  " 2>/dev/null || true
+done
+echo "✓ All databases reset"
+"""
+
+[tasks.setup]
+description = "Local: Run pg_partman setup on all databases"
+run = """
+#!/usr/bin/env bash
+set -e
+POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+
+echo ""
+echo "=== pg_partman SETUP ==="
+echo "Config: 1-minute partitions, 10 min history, 5 min retention, 100 test records"
+echo ""
+
 kubectl cp test/setup_partman.sql ${POD}:/tmp/setup_partman.sql -c database
 
 for db in ${DATABASES}; do
-  echo "→ Setting up pg_partman in ${db}..."
-  kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -f /tmp/setup_partman.sql -q
+  echo "--- ${db} ---"
+  kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -f /tmp/setup_partman.sql
 done
 
-echo "✓ pg_partman setup complete"
+echo ""
+echo "=== SETUP COMPLETE ==="
+for db in ${DATABASES}; do
+  P=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+  R=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+  echo "  ${db}: ${P} partitions, ${R} records"
+done
 """
+
+[tasks.dev]
+description = "Local: Reset + Setup (quick iteration)"
+depends = ["reset", "setup"]
 
 [tasks.validate]
-description = "Validate pg_partman_bgw is working"
-depends = ["setup-partman"]
+description = "Run retention validation test (run setup first)"
 run = """
 #!/usr/bin/env bash
 set -e
-
 POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
 
 echo ""
-echo "=== Validation Results ==="
+echo "=== pg_partman VALIDATION ==="
 echo ""
 
-# Check shared_preload_libraries
-echo "1. shared_preload_libraries:"
-kubectl exec ${POD} -c database -- psql -U postgres -t -c "SHOW shared_preload_libraries;" | tr -d ' '
+# Validate both databases
+for db in db1 db2; do
+  echo "--- ${db} ---"
+  echo ""
 
-# Check pg_partman_bgw logs
-echo ""
-echo "2. pg_partman_bgw log entries:"
-kubectl exec ${POD} -c database -- cat /pgdata/logs/postgres/*.log 2>/dev/null | grep -i "pg_partman" | tail -5 || echo "   (no log entries yet)"
+  # State before maintenance
+  echo "BEFORE maintenance:"
+  BEFORE_P=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+  BEFORE_R=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+  echo "  Partitions: ${BEFORE_P}"
+  echo "  Records: ${BEFORE_R}"
+  kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "
+  SELECT tableoid::regclass::text as partition, COUNT(*) as records
+  FROM events GROUP BY tableoid ORDER BY partition;
+  "
 
-# Check partition counts
-echo ""
-echo "3. Partition counts per database:"
-for db in ${DATABASES}; do
-  COUNT=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" 2>/dev/null | tr -d ' ')
-  echo "   ${db}: ${COUNT} partitions"
+  # Run maintenance with timestamp
+  MAINT_TS=$(kubectl exec ${POD} -c database -- psql -U postgres -t -c "SELECT to_char(now(), 'YYYYMMDD_HH24MI');" | tr -d ' ')
+  echo "Running maintenance at ${MAINT_TS} (retention: 5 min → drop before ${MAINT_TS} - 5 min)..."
+  kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "CALL partman.run_maintenance_proc();" >/dev/null
+  echo ""
+
+  # State after maintenance  
+  echo "AFTER maintenance:"
+  AFTER_P=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+  AFTER_R=$(kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -t -c "SELECT COUNT(*) FROM events;" | tr -d ' ')
+  echo "  Partitions: ${AFTER_P}"
+  echo "  Records: ${AFTER_R}"
+  kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -c "
+  SELECT tableoid::regclass::text as partition, COUNT(*) as records
+  FROM events GROUP BY tableoid ORDER BY partition;
+  "
+
+  # Results for this DB
+  DROPPED_P=$((BEFORE_P - AFTER_P))
+  DROPPED_R=$((BEFORE_R - AFTER_R))
+  echo "RESULT: ${BEFORE_P} → ${AFTER_P} partitions (${DROPPED_P} dropped), ${BEFORE_R} → ${AFTER_R} records (${DROPPED_R} deleted)"
+  echo ""
+
+  if [ "$AFTER_P" -ge "$BEFORE_P" ]; then
+    echo "❌ TEST FAILED: No partitions were dropped in ${db}"
+    exit 1
+  fi
 done
 
-# Check part_config
-echo ""
-echo "4. pg_partman config (db1):"
-kubectl exec ${POD} -c database -- psql -U postgres -d db1 -c "SELECT parent_table, partition_interval, retention, automatic_maintenance FROM partman.part_config;" 2>/dev/null || echo "   (not configured yet)"
-
-echo ""
-echo "=== Validation Complete ==="
+echo "✅ TEST PASSED: Retention working correctly on all databases"
 """
 
-[tasks.validate-retention]
-description = "Wait and validate retention is working (takes ~3 minutes)"
-run = """
-#!/usr/bin/env bash
-set -e
-
-POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
-
-echo "→ Getting initial partition count..."
-INITIAL=$(kubectl exec ${POD} -c database -- psql -U postgres -d db1 -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-echo "  Initial: ${INITIAL} partitions"
-
-echo "→ Waiting 3 minutes for retention to kick in..."
-for i in {1..18}; do
-  sleep 10
-  COUNT=$(kubectl exec ${POD} -c database -- psql -U postgres -d db1 -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-  echo "  [$(($i * 10))s] ${COUNT} partitions"
-done
-
-FINAL=$(kubectl exec ${POD} -c database -- psql -U postgres -d db1 -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
-
-echo ""
-if [ "$FINAL" -lt "$INITIAL" ]; then
-  echo "✓ Retention is working! Partitions reduced from ${INITIAL} to ${FINAL}"
-else
-  echo "⚠ Retention may not be working. Partitions: ${INITIAL} → ${FINAL}"
-fi
-"""
-
-[tasks.logs]
-description = "Show pg_partman_bgw logs"
-run = """
-#!/usr/bin/env bash
-POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
-kubectl exec ${POD} -c database -- cat /pgdata/logs/postgres/*.log 2>/dev/null | grep -i "pg_partman" || echo "No partman logs found"
-"""
+# =============================================================================
+# UTILITY TASKS
+# =============================================================================
 
 [tasks.psql]
 description = "Connect to db1 via psql"
@@ -213,21 +229,33 @@ POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test
 kubectl exec -it ${POD} -c database -- psql -U postgres -d db1
 """
 
-[tasks.clean]
-description = "Full cleanup (delete cluster and images)"
-depends = ["cluster-down"]
+[tasks.logs]
+description = "Show pg_partman_bgw logs"
 run = """
 #!/usr/bin/env bash
-docker rmi ${IMAGE_NAME}:${IMAGE_TAG} 2>/dev/null || true
-echo "✓ Cleanup complete"
+POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+echo "=== pg_partman_bgw LOGS ==="
+kubectl exec ${POD} -c database -- cat /pgdata/logs/postgres/*.log 2>/dev/null | grep -i "pg_partman" | tail -20 || echo "No logs yet"
 """
 
-[tasks.build-local]
-description = "Build image locally"
+[tasks.status]
+description = "Show current state of db1"
 run = """
 #!/usr/bin/env bash
-set -e
-echo "→ Building image locally..."
-docker build -t ${IMAGE_NAME}:local .
-echo "✓ Built: ${IMAGE_NAME}:local"
+POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+echo "=== db1 STATUS ==="
+kubectl exec ${POD} -c database -- psql -U postgres -d db1 -c "
+SELECT 
+  (SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%') as partitions,
+  (SELECT COUNT(*) FROM events) as records,
+  (SELECT retention FROM partman.part_config WHERE parent_table = 'public.events') as retention;
+"
+kubectl exec ${POD} -c database -- psql -U postgres -d db1 -c "
+SELECT tableoid::regclass::text as partition, COUNT(*) as records
+FROM events GROUP BY tableoid ORDER BY partition;
+"
 """
+
+[tasks.clean]
+description = "Full cleanup (delete cluster)"
+depends = ["cluster-down"]
