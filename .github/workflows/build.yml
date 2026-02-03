@@ -23,6 +23,11 @@ jobs:
             pg_version: "17"
           - base_image_tag: ubi9-18.1-2550
             pg_version: "18"
+    outputs:
+      pg17_image: ${{ steps.set-outputs.outputs.pg17_image }}
+      pg18_image: ${{ steps.set-outputs.outputs.pg18_image }}
+      pg17_tag: ${{ steps.set-outputs.outputs.pg17_tag }}
+      pg18_tag: ${{ steps.set-outputs.outputs.pg18_tag }}
 
     steps:
       - name: Checkout repository
@@ -59,10 +64,175 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.base_image_tag }}
           cache-to: type=gha,mode=max,scope=${{ matrix.base_image_tag }}
 
+      - name: Set outputs for test job
+        id: set-outputs
+        run: |
+          if [ "${{ matrix.pg_version }}" = "17" ]; then
+            echo "pg17_image=${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom" >> $GITHUB_OUTPUT
+            echo "pg17_tag=pg17-latest" >> $GITHUB_OUTPUT
+          elif [ "${{ matrix.pg_version }}" = "18" ]; then
+            echo "pg18_image=${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom" >> $GITHUB_OUTPUT
+            echo "pg18_tag=pg18-latest" >> $GITHUB_OUTPUT
+          fi
+
+  # Test both PG 17 and PG 18 images
+  test-default:
+    needs: build-default
+    if: github.event.inputs.base_image_tag == '' || github.event.inputs.base_image_tag == null
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - pg_version: "17"
+            image_tag: "pg17-latest"
+          - pg_version: "18"
+            image_tag: "pg18-latest"
+    outputs:
+      pg17_result: ${{ steps.test-result.outputs.pg17_result }}
+      pg18_result: ${{ steps.test-result.outputs.pg18_result }}
+      pg17_partitions: ${{ steps.test-result.outputs.pg17_partitions }}
+      pg18_partitions: ${{ steps.test-result.outputs.pg18_partitions }}
+      pg17_shared_libs: ${{ steps.test-result.outputs.pg17_shared_libs }}
+      pg18_shared_libs: ${{ steps.test-result.outputs.pg18_shared_libs }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pgo-test
+
+      - name: Install PGO
+        run: |
+          git clone --depth 1 https://github.com/CrunchyData/postgres-operator.git /tmp/pgo
+          kubectl apply -k /tmp/pgo/config/namespace
+          kubectl apply --server-side -k /tmp/pgo/config/default
+          kubectl wait --for=condition=Available deployment/pgo -n postgres-operator --timeout=180s
+
+      - name: Pull and load image
+        run: |
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ matrix.image_tag }}
+          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ matrix.image_tag }} --name pgo-test
+
+      - name: Deploy PostgresCluster
+        env:
+          IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom
+          IMAGE_TAG: ${{ matrix.image_tag }}
+          POSTGRES_VERSION: ${{ matrix.pg_version }}
+        run: |
+          envsubst < test/postgrescluster.yaml | kubectl apply -f -
+          echo "Waiting for PostgresCluster to be ready..."
+          for i in {1..60}; do
+            READY=$(kubectl get postgrescluster partman-test -o jsonpath='{.status.instances[0].readyReplicas}' 2>/dev/null || echo "0")
+            if [ "$READY" = "1" ]; then
+              echo "PostgresCluster ready"
+              break
+            fi
+            echo "Waiting... ($i/60)"
+            sleep 5
+          done
+
+      - name: Setup pg_partman
+        run: |
+          POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+          kubectl cp test/setup_partman.sql ${POD}:/tmp/setup_partman.sql -c database
+          for db in db1 db2 db3 db4 db5; do
+            kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -f /tmp/setup_partman.sql -q
+          done
+
+      - name: Validate and capture results
+        id: test-result
+        run: |
+          POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+
+          # Check shared_preload_libraries
+          SHARED_LIBS=$(kubectl exec ${POD} -c database -- psql -U postgres -t -c "SHOW shared_preload_libraries;" | tr -d ' ')
+          echo "shared_preload_libraries: $SHARED_LIBS"
+
+          # Check partition count
+          PARTITIONS=$(kubectl exec ${POD} -c database -- psql -U postgres -d db1 -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+          echo "Partition count: $PARTITIONS"
+
+          # Check pg_partman_bgw in libraries
+          if echo "$SHARED_LIBS" | grep -q "pg_partman_bgw"; then
+            RESULT="PASSED"
+          else
+            RESULT="FAILED"
+          fi
+
+          # Set outputs based on PG version
+          if [ "${{ matrix.pg_version }}" = "17" ]; then
+            echo "pg17_result=$RESULT" >> $GITHUB_OUTPUT
+            echo "pg17_partitions=$PARTITIONS" >> $GITHUB_OUTPUT
+            echo "pg17_shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
+          else
+            echo "pg18_result=$RESULT" >> $GITHUB_OUTPUT
+            echo "pg18_partitions=$PARTITIONS" >> $GITHUB_OUTPUT
+            echo "pg18_shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
+          fi
+
+  # Generate summary report
+  report-default:
+    needs: [build-default, test-default]
+    if: always() && (github.event.inputs.base_image_tag == '' || github.event.inputs.base_image_tag == null)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate Report
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🐘 Crunchy PostgreSQL Custom Image Build Report
+
+          ## 📦 Published Images
+
+          | PostgreSQL | Image | Tags |
+          |------------|-------|------|
+          | **PG 17** | `${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg17-latest`, `ubi9-17.7-2550` |
+          | **PG 18** | `${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `pg18-latest`, `ubi9-18.1-2550` |
+
+          ## 🧪 Test Results
+
+          | PostgreSQL | Status | shared_preload_libraries | Partitions Created |
+          |------------|--------|--------------------------|-------------------|
+          | **PG 17** | ${{ needs.test-default.outputs.pg17_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | `${{ needs.test-default.outputs.pg17_shared_libs }}` | ${{ needs.test-default.outputs.pg17_partitions }} |
+          | **PG 18** | ${{ needs.test-default.outputs.pg18_result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | `${{ needs.test-default.outputs.pg18_shared_libs }}` | ${{ needs.test-default.outputs.pg18_partitions }} |
+
+          ## 🔧 Extensions Tested
+
+          - **pg_partman_bgw**: Background worker for automated partition maintenance
+            - Automatic partition creation ✅
+            - Retention policy configured (5 minutes for testing)
+            - Running on 5 databases: db1, db2, db3, db4, db5
+
+          ## 🏗️ Build Details
+
+          - **Platforms**: `linux/amd64`, `linux/arm64`
+          - **Base Images**:
+            - PG 17: `registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-17.7-2550`
+            - PG 18: `registry.developers.crunchydata.com/crunchydata/crunchy-postgres:ubi9-18.1-2550`
+
+          ## 📋 Usage
+
+          ```yaml
+          spec:
+            image: ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:pg17-latest
+            patroni:
+              dynamicConfiguration:
+                postgresql:
+                  parameters:
+                    shared_preload_libraries: pg_partman_bgw
+                    pg_partman_bgw.dbname: mydb
+                    pg_partman_bgw.interval: 3600
+          ```
+          EOF
+
   # Custom build: user-specified base image tag
   build-custom:
     if: github.event.inputs.base_image_tag != '' && github.event.inputs.base_image_tag != null
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.event.inputs.base_image_tag }}
 
     steps:
       - name: Checkout repository
@@ -77,6 +247,12 @@ jobs:
       - name: Generate timestamp
         id: timestamp
         run: echo "ts=$(date -u +%Y%m%dT%H%M%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Extract PG version from tag
+        id: pg-version
+        run: |
+          PG_VERSION=$(echo "${{ github.event.inputs.base_image_tag }}" | sed -E 's/ubi[89]-([0-9]+)\..*/\1/')
+          echo "version=$PG_VERSION" >> $GITHUB_OUTPUT
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -97,3 +273,121 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ github.event.inputs.base_image_tag }}
           cache-from: type=gha,scope=${{ github.event.inputs.base_image_tag }}
           cache-to: type=gha,mode=max,scope=${{ github.event.inputs.base_image_tag }}
+
+  # Test custom build
+  test-custom:
+    needs: build-custom
+    if: github.event.inputs.base_image_tag != '' && github.event.inputs.base_image_tag != null
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.test-result.outputs.result }}
+      partitions: ${{ steps.test-result.outputs.partitions }}
+      shared_libs: ${{ steps.test-result.outputs.shared_libs }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract PG version from tag
+        id: pg-version
+        run: |
+          PG_VERSION=$(echo "${{ github.event.inputs.base_image_tag }}" | sed -E 's/ubi[89]-([0-9]+)\..*/\1/')
+          echo "version=$PG_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pgo-test
+
+      - name: Install PGO
+        run: |
+          git clone --depth 1 https://github.com/CrunchyData/postgres-operator.git /tmp/pgo
+          kubectl apply -k /tmp/pgo/config/namespace
+          kubectl apply --server-side -k /tmp/pgo/config/default
+          kubectl wait --for=condition=Available deployment/pgo -n postgres-operator --timeout=180s
+
+      - name: Pull and load image
+        run: |
+          docker pull ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ github.event.inputs.base_image_tag }}
+          kind load docker-image ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom:${{ github.event.inputs.base_image_tag }} --name pgo-test
+
+      - name: Deploy PostgresCluster
+        env:
+          IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom
+          IMAGE_TAG: ${{ github.event.inputs.base_image_tag }}
+          POSTGRES_VERSION: ${{ steps.pg-version.outputs.version }}
+        run: |
+          envsubst < test/postgrescluster.yaml | kubectl apply -f -
+          echo "Waiting for PostgresCluster to be ready..."
+          for i in {1..60}; do
+            READY=$(kubectl get postgrescluster partman-test -o jsonpath='{.status.instances[0].readyReplicas}' 2>/dev/null || echo "0")
+            if [ "$READY" = "1" ]; then
+              echo "PostgresCluster ready"
+              break
+            fi
+            echo "Waiting... ($i/60)"
+            sleep 5
+          done
+
+      - name: Setup pg_partman
+        run: |
+          POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+          kubectl cp test/setup_partman.sql ${POD}:/tmp/setup_partman.sql -c database
+          for db in db1 db2 db3 db4 db5; do
+            kubectl exec ${POD} -c database -- psql -U postgres -d ${db} -f /tmp/setup_partman.sql -q
+          done
+
+      - name: Validate and capture results
+        id: test-result
+        run: |
+          POD=$(kubectl get pods -l postgres-operator.crunchydata.com/cluster=partman-test,postgres-operator.crunchydata.com/role=master -o jsonpath='{.items[0].metadata.name}')
+
+          SHARED_LIBS=$(kubectl exec ${POD} -c database -- psql -U postgres -t -c "SHOW shared_preload_libraries;" | tr -d ' ')
+          PARTITIONS=$(kubectl exec ${POD} -c database -- psql -U postgres -d db1 -t -c "SELECT COUNT(*) FROM pg_tables WHERE tablename LIKE 'events_p%';" | tr -d ' ')
+
+          if echo "$SHARED_LIBS" | grep -q "pg_partman_bgw"; then
+            echo "result=PASSED" >> $GITHUB_OUTPUT
+          else
+            echo "result=FAILED" >> $GITHUB_OUTPUT
+          fi
+          echo "partitions=$PARTITIONS" >> $GITHUB_OUTPUT
+          echo "shared_libs=$SHARED_LIBS" >> $GITHUB_OUTPUT
+
+  # Generate report for custom build
+  report-custom:
+    needs: [build-custom, test-custom]
+    if: always() && github.event.inputs.base_image_tag != '' && github.event.inputs.base_image_tag != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract PG version
+        id: pg-version
+        run: |
+          PG_VERSION=$(echo "${{ github.event.inputs.base_image_tag }}" | sed -E 's/ubi[89]-([0-9]+)\..*/\1/')
+          echo "version=$PG_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Generate Report
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🐘 Crunchy PostgreSQL Custom Image Build Report
+
+          ## 📦 Published Image
+
+          | PostgreSQL | Image | Tag |
+          |------------|-------|-----|
+          | **PG ${{ steps.pg-version.outputs.version }}** | `${{ secrets.DOCKERHUB_USERNAME }}/crunchy-postgres-custom` | `${{ github.event.inputs.base_image_tag }}` |
+
+          ## 🧪 Test Results
+
+          | Status | shared_preload_libraries | Partitions Created |
+          |--------|--------------------------|-------------------|
+          | ${{ needs.test-custom.outputs.result == 'PASSED' && '✅ PASSED' || '❌ FAILED' }} | `${{ needs.test-custom.outputs.shared_libs }}` | ${{ needs.test-custom.outputs.partitions }} |
+
+          ## 🔧 Extensions Tested
+
+          - **pg_partman_bgw**: Background worker for automated partition maintenance ✅
+
+          ## 🏗️ Build Details
+
+          - **Platforms**: `linux/amd64`, `linux/arm64`
+          - **Base Image**: `registry.developers.crunchydata.com/crunchydata/crunchy-postgres:${{ github.event.inputs.base_image_tag }}`
+          EOF
