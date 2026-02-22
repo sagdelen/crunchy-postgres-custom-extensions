@@ -18,6 +18,105 @@ This repository builds custom [Crunchy PostgreSQL](https://www.crunchydata.com/p
 | PostgreSQL Version | 17.2                                                                           |
 | OS                 | Red Hat UBI 8                                                                  |
 
+## Using as a Standalone Docker Container
+
+You can run this image as a standalone Docker container for local development and testing. Since the Crunchy base image doesn't include an automatic entrypoint like the official PostgreSQL image, you need to initialize the database manually.
+
+### Quick Start
+
+```bash
+# Build the image (if not already built)
+docker build -t crunchy-postgres-custom:local .
+
+# Run the container
+docker run --rm --name crunchy-postgres \
+  -p 5432:5432 \
+  crunchy-postgres-custom:local \
+  bash -c '
+    PGDATA=/tmp/pgdata
+    initdb -D $PGDATA --auth=trust --username=postgres &&
+    cat >> $PGDATA/postgresql.conf <<EOF
+shared_preload_libraries = '"'"'pg_partman_bgw'"'"'
+pg_partman_bgw.dbname = '"'"'postgres'"'"'
+pg_partman_bgw.interval = 3600
+pg_partman_bgw.role = '"'"'postgres'"'"'
+listen_addresses = '"'"'*'"'"'
+EOF
+    echo "host all all 0.0.0.0/0 md5" >> $PGDATA/pg_hba.conf &&
+    echo "host all all ::/0 md5" >> $PGDATA/pg_hba.conf &&
+    postgres -D $PGDATA
+  '
+```
+
+### Set Up pg_partman Extension
+
+Once the container is running, open a new terminal and run:
+
+```bash
+docker exec crunchy-postgres psql -U postgres -c "ALTER USER postgres PASSWORD 'postgres';"
+docker exec crunchy-postgres psql -U postgres -c "CREATE SCHEMA IF NOT EXISTS partman;"
+docker exec crunchy-postgres psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS pg_partman SCHEMA partman;"
+```
+
+### Verify
+
+```bash
+docker exec crunchy-postgres psql -U postgres -c "SHOW shared_preload_libraries;"
+docker exec crunchy-postgres psql -U postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_partman';"
+```
+
+### Connect
+
+```bash
+psql -h localhost -U postgres -p 5432
+# Password: postgres
+```
+
+> **Note:** Data is stored inside the container and will be lost when it is removed. For persistent data, mount a volume with proper ownership (UID 26 / postgres user).
+
+---
+
+## Using with Docker Compose
+
+A `docker-compose.yml` and an entrypoint script are provided for a more convenient setup. Docker Compose handles initialization, extension creation, and password configuration automatically.
+
+### Quick Start
+
+```bash
+# Build the image (if not already built)
+docker build -t crunchy-postgres-custom:local .
+
+# Start the service
+docker compose up -d
+
+# Check logs
+docker compose logs -f postgres
+```
+
+### Verify
+
+```bash
+docker exec crunchy-postgres psql -U postgres -c "SHOW shared_preload_libraries;"
+docker exec crunchy-postgres psql -U postgres -c "SELECT extname, extversion FROM pg_extension WHERE extname = 'pg_partman';"
+```
+
+### Connect
+
+```bash
+psql -h localhost -U postgres -p 5432
+# Password: postgres
+```
+
+### Stop
+
+```bash
+docker compose down
+```
+
+> **Note:** The default Docker Compose configuration stores data inside the container. To add persistence, you can mount a Docker volume — ensure the volume directory is writable by UID 26 (the postgres user inside the container).
+
+---
+
 ## Using with Crunchy PostgreSQL Operator v5.7
 
 To use this custom image with the Crunchy PostgreSQL Operator (PGO) v5.7:
